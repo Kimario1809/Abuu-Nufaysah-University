@@ -1,0 +1,693 @@
+#!/usr/bin/env php
+<?php
+/**
+ * Migration Runner Script
+ * 
+ * Usage:
+ *   php bin/migrate [command] [options]
+ * 
+ * Commands:
+ *   migrate   - Run all pending migrations
+ *   rollback  - Rollback the last batch
+ *   reset     - Rollback all migrations
+ *   refresh   - Reset and migrate fresh
+ *   status    - Show migration status
+ *   make      - Create new migration
+ *   fresh     - Drop all tables and migrate fresh
+ *   help      - Show help
+ * 
+ * Options:
+ *   --force   - Force in production
+ *   --pretend - Preview SQL queries
+ *   --seed    - Run seeders after migration
+ *   --name    - Name for migration (with make command)
+ */
+
+// =============================================
+// 1. SETUP
+// =============================================
+
+date_default_timezone_set('Africa/Dar_es_Salaam');
+
+define('ROOT_PATH', dirname(__DIR__));
+define('MIGRATION_PATH', ROOT_PATH . '/database/migrations');
+
+// Load .env
+if (file_exists(ROOT_PATH . '/.env')) {
+    $lines = file(ROOT_PATH . '/.env');
+    foreach ($lines as $line) {
+        $line = trim($line);
+        if (empty($line) || strpos($line, '#') === 0) continue;
+        list($key, $value) = explode('=', $line, 2);
+        $_ENV[trim($key)] = trim($value);
+        putenv("$key=$value");
+    }
+}
+
+require_once ROOT_PATH . '/database/migrations/Migration.php';
+
+// Autoloader
+spl_autoload_register(function ($class) {
+    $prefix = 'App\\';
+    $base_dir = ROOT_PATH . '/app/';
+    
+    $len = strlen($prefix);
+    if (strncmp($prefix, $class, $len) !== 0) return;
+    
+    $relative_class = substr($class, $len);
+    $file = $base_dir . str_replace('\\', '/', $relative_class) . '.php';
+    
+    if (file_exists($file)) require $file;
+});
+
+// =============================================
+// 2. DATABASE CONNECTION
+// =============================================
+
+use App\Core\Database;
+
+try {
+    $db = Database::getInstance();
+} catch (Exception $e) {
+    echo "\033[31m❌ Database connection failed: " . $e->getMessage() . "\033[0m\n";
+    exit(1);
+}
+
+// =============================================
+// 3. MIGRATION RUNNER CLASS
+// =============================================
+
+class MigrationRunner {
+    private $db;
+    private $migrationsTable = 'migrations';
+    private $migrationPath;
+    private $pretend = false;
+    private $force = false;
+    
+    public function __construct($db) {
+        $this->db = $db;
+        $this->migrationPath = MIGRATION_PATH;
+        $this->ensureMigrationsTable();
+    }
+    
+    /**
+     * Create migrations tracking table
+     */
+    private function ensureMigrationsTable() {
+        $sql = "CREATE TABLE IF NOT EXISTS `{$this->migrationsTable}` (
+            `id` INT PRIMARY KEY AUTO_INCREMENT,
+            `migration` VARCHAR(255) NOT NULL,
+            `batch` INT NOT NULL,
+            `executed_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE KEY `unique_migration` (`migration`),
+            INDEX `idx_batch` (`batch`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+        
+        $this->db->query($sql);
+    }
+    
+    /**
+     * Main runner
+     */
+    public function run($argv) {
+        $command = $argv[1] ?? 'help';
+        $options = $this->parseOptions($argv);
+        
+        $this->pretend = isset($options['pretend']);
+        $this->force = isset($options['force']);
+        
+        switch ($command) {
+            case 'migrate':   $this->migrate($options); break;
+            case 'rollback':  $this->rollback($options); break;
+            case 'reset':     $this->reset($options); break;
+            case 'refresh':   $this->refresh($options); break;
+            case 'status':    $this->status(); break;
+            case 'make':      $this->make($options); break;
+            case 'fresh':     $this->fresh($options); break;
+            case 'help':
+            default:          $this->showHelp(); break;
+        }
+    }
+    
+    /**
+     * Parse command line options
+     */
+    private function parseOptions($argv) {
+        $options = [];
+        for ($i = 2; $i < count($argv); $i++) {
+            $arg = $argv[$i];
+            if (strpos($arg, '--') === 0) {
+                $opt = substr($arg, 2);
+                if (strpos($opt, '=') !== false) {
+                    list($key, $value) = explode('=', $opt, 2);
+                    $options[$key] = $value;
+                } else {
+                    $options[$opt] = true;
+                }
+            }
+        }
+        return $options;
+    }
+    
+    /**
+     * Show help
+     */
+    private function showHelp() {
+        $this->outputLine("");
+        $this->outputLine("╔══════════════════════════════════════════════════════════════╗");
+        $this->outputLine("║     Abuu Nufay'sah University - Migration Tool            ║");
+        $this->outputLine("╚══════════════════════════════════════════════════════════════╝");
+        $this->outputLine("");
+        $this->outputLine("📌 USAGE:");
+        $this->outputLine("   php bin/migrate [command] [options]");
+        $this->outputLine("");
+        $this->outputLine("📋 COMMANDS:");
+        $this->outputLine("   migrate      Run all pending migrations");
+        $this->outputLine("   rollback     Rollback the last batch");
+        $this->outputLine("   reset        Rollback all migrations");
+        $this->outputLine("   refresh      Reset and migrate fresh");
+        $this->outputLine("   status       Show migration status");
+        $this->outputLine("   make         Create a new migration");
+        $this->outputLine("   fresh        Drop all tables and migrate fresh");
+        $this->outputLine("   help         Show this help");
+        $this->outputLine("");
+        $this->outputLine("⚙️  OPTIONS:");
+        $this->outputLine("   --force      Force in production");
+        $this->outputLine("   --pretend    Preview SQL queries");
+        $this->outputLine("   --seed       Run seeders after migration");
+        $this->outputLine("   --name=NAME  Name for migration (with make)");
+        $this->outputLine("");
+        $this->outputLine("💡 EXAMPLES:");
+        $this->outputLine("   php bin/migrate migrate");
+        $this->outputLine("   php bin/migrate rollback --pretend");
+        $this->outputLine("   php bin/migrate make --name=create_exams_table");
+        $this->outputLine("   php bin/migrate refresh --seed");
+        $this->outputLine("");
+    }
+    
+    /**
+     * Get pending migrations
+     */
+    private function getPendingMigrations() {
+        $files = glob($this->migrationPath . '/*.php');
+        $pending = [];
+        
+        foreach ($files as $file) {
+            $filename = basename($file, '.php');
+            if (!$this->isMigrationExecuted($filename)) {
+                $pending[] = ['name' => $filename, 'file' => $file];
+            }
+        }
+        
+        usort($pending, function($a, $b) {
+            return strcmp($a['name'], $b['name']);
+        });
+        
+        return $pending;
+    }
+    
+    /**
+     * Check if migration executed
+     */
+    private function isMigrationExecuted($migration) {
+        $sql = "SELECT id FROM `{$this->migrationsTable}` WHERE migration = ?";
+        $stmt = $this->db->query($sql, [$migration]);
+        return $stmt->fetch() !== false;
+    }
+    
+    /**
+     * Get next batch number
+     */
+    private function getNextBatchNumber() {
+        $sql = "SELECT MAX(batch) as max_batch FROM `{$this->migrationsTable}`";
+        $stmt = $this->db->query($sql);
+        $result = $stmt->fetch();
+        return ($result['max_batch'] ?? 0) + 1;
+    }
+    
+    /**
+     * Get last batch number
+     */
+    private function getLastBatchNumber() {
+        $sql = "SELECT MAX(batch) as max_batch FROM `{$this->migrationsTable}`";
+        $stmt = $this->db->query($sql);
+        $result = $stmt->fetch();
+        return $result['max_batch'] ?? null;
+    }
+    
+    /**
+     * Get migrations by batch
+     */
+    private function getMigrationsByBatch($batch) {
+        $sql = "SELECT * FROM `{$this->migrationsTable}` WHERE batch = ? ORDER BY id DESC";
+        $stmt = $this->db->query($sql, [$batch]);
+        return $stmt->fetchAll();
+    }
+    
+    /**
+     * Get all migrations
+     */
+    private function getAllMigrations() {
+        $sql = "SELECT * FROM `{$this->migrationsTable}` ORDER BY id DESC";
+        $stmt = $this->db->query($sql);
+        return $stmt->fetchAll();
+    }
+    
+    /**
+     * Get migration by name
+     */
+    private function getMigrationByName($name) {
+        $sql = "SELECT * FROM `{$this->migrationsTable}` WHERE migration = ?";
+        $stmt = $this->db->query($sql, [$name]);
+        return $stmt->fetch();
+    }
+    
+    /**
+     * Get all tables
+     */
+    private function getAllTables() {
+        $sql = "SHOW TABLES";
+        $stmt = $this->db->query($sql);
+        $tables = [];
+        while ($row = $stmt->fetch(\PDO::FETCH_NUM)) {
+            $tables[] = $row[0];
+        }
+        return $tables;
+    }
+    
+    /**
+     * Run migration file
+     */
+    private function runMigrationFile($file) {
+        require_once $file;
+        
+        $filename = basename($file, '.php');
+        $className = $this->getMigrationClassName($filename);
+        $qualifiedClassName = $this->resolveMigrationClassName($className);
+        
+        if (!class_exists($qualifiedClassName)) {
+            throw new \Exception("Class '{$qualifiedClassName}' not found in {$file}");
+        }
+        
+        $instance = new $qualifiedClassName();
+        $instance->up();
+    }
+    
+    /**
+     * Rollback migration file
+     */
+    private function rollbackMigrationFile($migration) {
+        $file = $this->migrationPath . '/' . $migration . '.php';
+        
+        if (!file_exists($file)) {
+            $this->outputLine("     ⚠️  File not found: {$migration}");
+            return;
+        }
+        
+        require_once $file;
+        
+        $className = $this->getMigrationClassName($migration);
+        $qualifiedClassName = $this->resolveMigrationClassName($className);
+        
+        if (!class_exists($qualifiedClassName)) {
+            throw new \Exception("Class '{$qualifiedClassName}' not found");
+        }
+        
+        $instance = new $qualifiedClassName();
+        $instance->down();
+    }
+    
+    /**
+     * Get migration class name
+     */
+    private function getMigrationClassName($filename) {
+        $filename = preg_replace('/^\d+_/', '', $filename);
+        $parts = explode('_', $filename);
+        $name = implode('_', $parts);
+        return $this->convertToPascalCase($name);
+    }
+    
+    /**
+     * Convert snake_case to PascalCase
+     */
+    private function convertToPascalCase($string) {
+        $parts = explode('_', $string);
+        $parts = array_map('ucfirst', $parts);
+        return implode('', $parts);
+    }
+
+    private function resolveMigrationClassName($className) {
+        $candidates = [
+            $className,
+            'App\\Database\\Migrations\\' . $className,
+            'App\\Database\\Migrations\\' . ltrim($className, '\\')
+        ];
+
+        foreach ($candidates as $candidate) {
+            if (class_exists($candidate)) {
+                return $candidate;
+            }
+        }
+
+        return $className;
+    }
+    
+    /**
+     * Record migration
+     */
+    private function recordMigration($migration, $batch) {
+        $sql = "INSERT INTO `{$this->migrationsTable}` (migration, batch) VALUES (?, ?)";
+        $this->db->query($sql, [$migration, $batch]);
+    }
+    
+    /**
+     * Delete migration record
+     */
+    private function deleteMigration($id) {
+        $sql = "DELETE FROM `{$this->migrationsTable}` WHERE id = ?";
+        $this->db->query($sql, [$id]);
+    }
+    
+    /**
+     * Check production
+     */
+    private function isProduction() {
+        return ($_ENV['APP_ENV'] ?? 'development') === 'production';
+    }
+    
+    /**
+     * Output line
+     */
+    private function outputLine($text = '') {
+        echo $text . "\n";
+    }
+    
+    /**
+     * ==========================================
+     * COMMAND: MIGRATE
+     * ==========================================
+     */
+    private function migrate($options) {
+        $pending = $this->getPendingMigrations();
+        
+        if (empty($pending)) {
+            $this->outputLine("✅ Database is up to date!");
+            return;
+        }
+        
+        $this->outputLine("🔄 Running migrations...\n");
+        
+        $batch = $this->getNextBatchNumber();
+        $count = 0;
+        
+        foreach ($pending as $migration) {
+            $this->outputLine("  📦 {$migration['name']}");
+            
+            if ($this->pretend) {
+                $this->outputLine("     [PRETEND] Would run");
+            } else {
+                $this->runMigrationFile($migration['file']);
+                $this->recordMigration($migration['name'], $batch);
+                $count++;
+            }
+        }
+        
+        $this->outputLine("");
+        if ($this->pretend) {
+            $this->outputLine("ℹ️  PRETEND mode - No changes made");
+        } else {
+            $this->outputLine("✅ Migrated successfully! ({$count} migrations)");
+            
+            if (isset($options['seed'])) {
+                $this->runSeeders();
+            }
+        }
+    }
+    
+    /**
+     * ==========================================
+     * COMMAND: ROLLBACK
+     * ==========================================
+     */
+    private function rollback($options) {
+        $lastBatch = $this->getLastBatchNumber();
+        
+        if ($lastBatch === null) {
+            $this->outputLine("ℹ️  Nothing to rollback");
+            return;
+        }
+        
+        $migrations = $this->getMigrationsByBatch($lastBatch);
+        
+        $this->outputLine("🔄 Rolling back batch #{$lastBatch}...\n");
+        
+        foreach ($migrations as $migration) {
+            $this->outputLine("  ⏪ {$migration['migration']}");
+            
+            if ($this->pretend) {
+                $this->outputLine("     [PRETEND] Would rollback");
+            } else {
+                $this->rollbackMigrationFile($migration['migration']);
+                $this->deleteMigration($migration['id']);
+            }
+        }
+        
+        $this->outputLine("");
+        if ($this->pretend) {
+            $this->outputLine("ℹ️  PRETEND mode - No changes made");
+        } else {
+            $this->outputLine("✅ Rollback completed!");
+        }
+    }
+    
+    /**
+     * ==========================================
+     * COMMAND: RESET
+     * ==========================================
+     */
+    private function reset($options) {
+        if (!$this->force && $this->isProduction()) {
+            $this->outputLine("⚠️  PRODUCTION: Use --force to reset");
+            return;
+        }
+        
+        $migrations = $this->getAllMigrations();
+        
+        if (empty($migrations)) {
+            $this->outputLine("ℹ️  No migrations to reset");
+            return;
+        }
+        
+        $this->outputLine("🔄 Resetting all migrations...\n");
+        
+        foreach ($migrations as $migration) {
+            $this->outputLine("  ⏪ {$migration['migration']}");
+            
+            if ($this->pretend) {
+                $this->outputLine("     [PRETEND] Would reset");
+            } else {
+                $this->rollbackMigrationFile($migration['migration']);
+                $this->deleteMigration($migration['id']);
+            }
+        }
+        
+        $this->outputLine("");
+        if ($this->pretend) {
+            $this->outputLine("ℹ️  PRETEND mode - No changes made");
+        } else {
+            $this->outputLine("✅ Reset completed!");
+        }
+    }
+    
+    /**
+     * ==========================================
+     * COMMAND: REFRESH
+     * ==========================================
+     */
+    private function refresh($options) {
+        $this->outputLine("🔄 Refreshing database...\n");
+        $this->reset($options);
+        $this->outputLine("");
+        $this->migrate($options);
+    }
+    
+    /**
+     * ==========================================
+     * COMMAND: FRESH
+     * ==========================================
+     */
+    private function fresh($options) {
+        if (!$this->force && $this->isProduction()) {
+            $this->outputLine("⚠️  PRODUCTION: Use --force to drop all tables");
+            return;
+        }
+        
+        $this->outputLine("🔄 Fresh installation...\n");
+        
+        $tables = $this->getAllTables();
+        
+        if (!empty($tables)) {
+            $this->outputLine("  Dropping tables...");
+            
+            $this->db->query("SET FOREIGN_KEY_CHECKS = 0");
+            
+            foreach ($tables as $table) {
+                if ($this->pretend) {
+                    $this->outputLine("     [PRETEND] Would drop: {$table}");
+                } else {
+                    $this->db->query("DROP TABLE IF EXISTS `$table`");
+                    $this->outputLine("     ✅ Dropped: {$table}");
+                }
+            }
+            
+            $this->db->query("SET FOREIGN_KEY_CHECKS = 1");
+        }
+        
+        $this->outputLine("");
+        
+        if (!$this->pretend) {
+            $this->db->query("TRUNCATE TABLE `{$this->migrationsTable}`");
+        }
+        
+        $this->outputLine("");
+        $this->migrate($options);
+    }
+    
+    /**
+     * ==========================================
+     * COMMAND: STATUS
+     * ==========================================
+     */
+    private function status() {
+        $this->outputLine("\n📊 Migration Status");
+        $this->outputLine(str_repeat("═", 70));
+        $this->outputLine("");
+        
+        $files = glob($this->migrationPath . '/*.php');
+        $executed = $this->getAllMigrations();
+        $executedNames = array_column($executed, 'migration');
+        
+        $this->outputLine(sprintf("%-50s %-15s %s", "Migration", "Batch", "Status"));
+        $this->outputLine(str_repeat("─", 70));
+        
+        foreach ($files as $file) {
+            $filename = basename($file, '.php');
+            $isExecuted = in_array($filename, $executedNames);
+            
+            $batch = '';
+            $status = '❌ Pending';
+            $color = "\033[31m";
+            
+            if ($isExecuted) {
+                $migration = $this->getMigrationByName($filename);
+                $batch = $migration['batch'];
+                $status = '✅ Executed';
+                $color = "\033[32m";
+            }
+            
+            $this->outputLine(sprintf(
+                "%s%-50s%s %-15s %s",
+                $color,
+                $filename,
+                "\033[0m",
+                $batch,
+                $status
+            ));
+        }
+        
+        $this->outputLine("");
+        $this->outputLine("Total: " . count($files) . " migrations");
+        $this->outputLine("Executed: " . count($executed));
+        $this->outputLine("Pending: " . (count($files) - count($executed)));
+        $this->outputLine("");
+    }
+    
+    /**
+     * ==========================================
+     * COMMAND: MAKE
+     * ==========================================
+     */
+    private function make($options) {
+        $name = $options['name'] ?? null;
+        
+        if (!$name) {
+            $this->outputLine("❌ Error: Please provide --name=NAME");
+            $this->outputLine("   Example: php bin/migrate make --name=create_exams_table");
+            return;
+        }
+        
+        $timestamp = date('Ymd_His');
+        $className = $this->convertToPascalCase($name);
+        $filename = $timestamp . '_' . $name . '.php';
+        $filepath = $this->migrationPath . '/' . $filename;
+        
+        if (file_exists($filepath)) {
+            $this->outputLine("❌ File already exists: {$filename}");
+            return;
+        }
+        
+        $template = <<<PHP
+<?php
+namespace App\Database\Migrations;
+
+class {$className} extends Migration {
+    public function up() {
+        // TODO: Implement migration
+    }
+    
+    public function down() {
+        // TODO: Implement rollback
+    }
+}
+PHP;
+        
+        file_put_contents($filepath, $template);
+        
+        $this->outputLine("✅ Migration created!");
+        $this->outputLine("   📄 File: {$filename}");
+        $this->outputLine("   📁 Path: {$filepath}");
+        $this->outputLine("");
+        $this->outputLine("📝 Don't forget to implement up() and down() methods.");
+    }
+    
+    /**
+     * ==========================================
+     * RUN SEEDERS
+     * ==========================================
+     */
+    private function runSeeders() {
+        $this->outputLine("");
+        $this->outputLine("🌱 Running seeders...");
+        
+        $seederPath = ROOT_PATH . '/database/seeds';
+        if (is_dir($seederPath)) {
+            $files = glob($seederPath . '/*.php');
+            foreach ($files as $file) {
+                require_once $file;
+                $filename = basename($file, '.php');
+                if (class_exists($filename)) {
+                    $seeder = new $filename();
+                    if (method_exists($seeder, 'run')) {
+                        $seeder->run();
+                        $this->outputLine("  ✅ Seeded: {$filename}");
+                    }
+                }
+            }
+        }
+        
+        $this->outputLine("✅ Seeders completed!");
+    }
+}
+
+// =============================================
+// 4. RUN THE SCRIPT
+// =============================================
+
+try {
+    $runner = new MigrationRunner($db);
+    $runner->run($argv);
+} catch (Exception $e) {
+    echo "\033[31m❌ Error: " . $e->getMessage() . "\033[0m\n";
+    echo "   📄 File: " . $e->getFile() . ":" . $e->getLine() . "\n";
+    exit(1);
+}

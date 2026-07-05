@@ -1,0 +1,61 @@
+#!/bin/bash
+
+# Production Database Backup Script
+# Abuu Nufaysah University System
+
+# Load environment variables
+if [ -f .env ]; then
+    export $(cat .env | grep -v '^#' | xargs)
+fi
+
+# Configuration
+DB_HOST="${DB_HOST:-localhost}"
+DB_PORT="${DB_PORT:-3306}"
+DB_NAME="${DB_DATABASE:-abuu_nufaysah_university}"
+DB_USER="${DB_USERNAME:-root}"
+DB_PASS="${DB_PASSWORD:-}"
+BACKUP_DIR="${BACKUP_PATH:-./backups}"
+RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-30}"
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+BACKUP_FILE="${BACKUP_DIR}/${DB_NAME}_${TIMESTAMP}.sql"
+COMPRESSED_FILE="${BACKUP_FILE}.gz"
+
+# Create backup directory if it doesn't exist
+mkdir -p "$BACKUP_DIR"
+
+echo "Starting database backup..."
+echo "Database: $DB_NAME"
+echo "Host: $DB_HOST"
+echo "Backup file: $COMPRESSED_FILE"
+
+# Perform database backup
+mysqldump -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" \
+    --single-transaction \
+    --quick \
+    --lock-tables=false \
+    --routines \
+    --triggers \
+    --events \
+    "$DB_NAME" | gzip > "$COMPRESSED_FILE"
+
+# Check if backup was successful
+if [ $? -eq 0 ]; then
+    echo "Backup completed successfully: $COMPRESSED_FILE"
+    
+    # Calculate file size
+    FILE_SIZE=$(du -h "$COMPRESSED_FILE" | cut -f1)
+    echo "Backup size: $FILE_SIZE"
+    
+    # Remove old backups beyond retention period
+    echo "Removing backups older than $RETENTION_DAYS days..."
+    find "$BACKUP_DIR" -name "${DB_NAME}_*.sql.gz" -type f -mtime +$RETENTION_DAYS -delete
+    
+    # List current backups
+    echo "Current backups:"
+    ls -lh "$BACKUP_DIR"/${DB_NAME}_*.sql.gz 2>/dev/null || echo "No backups found"
+    
+    exit 0
+else
+    echo "ERROR: Backup failed!"
+    exit 1
+fi

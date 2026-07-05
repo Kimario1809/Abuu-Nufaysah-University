@@ -1,0 +1,107 @@
+#!/usr/bin/env php
+<?php
+/**
+ * Log Rotation Script
+ * 
+ * Usage: php bin/rotate-logs [days]
+ * Example: php bin/rotate-logs 30  (keep logs for 30 days)
+ */
+
+date_default_timezone_set('Africa/Dar_es_Salaam');
+
+// Define paths
+define('ROOT_PATH', dirname(__DIR__));
+define('LOG_PATH', ROOT_PATH . '/logs');
+define('ARCHIVE_PATH', LOG_PATH . '/archive');
+
+// Get days to keep
+$daysToKeep = $argv[1] ?? 30;
+
+echo "🔄 Rotating logs older than $daysToKeep days...\n";
+echo "================================================\n\n";
+
+// Check if logs directory exists
+if (!is_dir(LOG_PATH)) {
+    echo "❌ Logs directory not found: " . LOG_PATH . "\n";
+    exit(1);
+}
+
+// Create archive directory if not exists
+if (!is_dir(ARCHIVE_PATH)) {
+    mkdir(ARCHIVE_PATH, 0755, true);
+}
+
+// Process log files
+$files = glob(LOG_PATH . '/*.log');
+$deleted = 0;
+$compressed = 0;
+$totalSize = 0;
+
+echo "📊 Found " . count($files) . " log files\n\n";
+
+foreach ($files as $file) {
+    $filename = basename($file);
+    $mtime = filemtime($file);
+    $age = (time() - $mtime) / 86400; // days
+    $size = filesize($file);
+    $totalSize += $size;
+    
+    $sizeFormatted = $size > 1048576 ? round($size / 1048576, 2) . ' MB' : round($size / 1024, 2) . ' KB';
+    
+    if ($age > $daysToKeep) {
+        // Archive old files
+        $archiveFile = ARCHIVE_PATH . '/' . $filename . '.gz';
+        $content = file_get_contents($file);
+        file_put_contents($archiveFile, gzencode($content, 9));
+        
+        // Delete original
+        unlink($file);
+        $deleted++;
+        echo "  ✅ Archived: $filename (Age: " . round($age, 1) . " days, Size: $sizeFormatted)\n";
+        
+    } elseif ($age > 7) {
+        // Compress old but keep within retention
+        $archiveFile = ARCHIVE_PATH . '/' . $filename . '.gz';
+        if (!file_exists($archiveFile)) {
+            $content = file_get_contents($file);
+            file_put_contents($archiveFile, gzencode($content, 9));
+            file_put_contents($file, ''); // Clear original
+            $compressed++;
+            echo "  📦 Compressed: $filename (Age: " . round($age, 1) . " days, Size: $sizeFormatted)\n";
+        }
+    } else {
+        echo "  📝 Keeping: $filename (Age: " . round($age, 1) . " days)\n";
+    }
+}
+
+// Clean old archives
+echo "\n📦 Checking archive files...\n";
+$archiveFiles = glob(ARCHIVE_PATH . '/*.log.gz');
+$archivedDeleted = 0;
+$archivedSize = 0;
+
+foreach ($archiveFiles as $file) {
+    $mtime = filemtime($file);
+    $age = (time() - $mtime) / 86400;
+    $size = filesize($file);
+    $archivedSize += $size;
+    
+    if ($age > $daysToKeep) {
+        unlink($file);
+        $archivedDeleted++;
+        echo "  🗑️  Deleted old archive: " . basename($file) . "\n";
+    }
+}
+
+// Summary
+echo "\n================================================\n";
+echo "✅ Log rotation completed!\n";
+echo "\n📊 Summary:\n";
+echo "   📝 Log files processed: " . count($files) . "\n";
+echo "   📦 Archived: $deleted files\n";
+echo "   📦 Compressed: $compressed files\n";
+echo "   🗑️  Archive files deleted: $archivedDeleted\n";
+echo "   📊 Total log size: " . ($totalSize > 1048576 ? round($totalSize / 1048576, 2) . ' MB' : round($totalSize / 1024, 2) . ' KB') . "\n";
+echo "   📊 Archive size: " . ($archivedSize > 1048576 ? round($archivedSize / 1048576, 2) . ' MB' : round($archivedSize / 1024, 2) . ' KB') . "\n";
+echo "   💾 Space saved: " . ($totalSize > 0 ? round($totalSize / 1048576, 2) . ' MB' : '0 KB') . "\n";
+echo "\n💡 Tip: Run 'php bin/rotate-logs 15' to keep only 15 days of logs\n";
